@@ -96,9 +96,15 @@ elif os.environ.get("YTDLP_COOKIES"):
         COOKIES_PATH = None; logger.warning("Failed to load YTDLP_COOKIES: %s", e)
 
 # ---------------- Utilities ----------------
+UA = os.environ.get("YTDLP_UA", "Mozilla/5.0")
 YDL_BASE_OPTS = {
-    "quiet": True, "no_warnings": True, "noplaylist": True, "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
-    "retries": 3, "fragment_retries": 3, "http_headers": {"User-Agent": "Mozilla/5.0"},
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
+    "retries": 3,
+    "fragment_retries": 3,
+    "http_headers": {"User-Agent": UA},   # <-- вот тут
     "force_ipv4": True,
     "extractor_args": {"youtube": {"player_client": ["android"]}},
 }
