@@ -12,7 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs
 import logging
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 import uvicorn
+import base64
 
 # ---------------- Config ----------------
 MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/data")
@@ -28,7 +30,6 @@ DB_PATH = os.path.join(MEDIA_ROOT, "history.sqlite3")
 # ---------------- App ----------------
 app = FastAPI(title="YouTube MP3 Bridge for MTA")
 
-# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -94,6 +95,25 @@ def db_recent(limit=50):
         for r in rows
     ]
 
+# ---------------- Cookies support ----------------
+COOKIES_PATH = None
+if os.environ.get("YTDLP_COOKIES_B64"):
+    try:
+        COOKIES_PATH = "/tmp/cookies.txt"
+        with open(COOKIES_PATH, "wb") as f:
+            f.write(base64.b64decode(os.environ["YTDLP_COOKIES_B64"]))
+    except Exception as e:
+        COOKIES_PATH = None
+        logger.warning("Failed to load YTDLP_COOKIES_B64: %s", e)
+elif os.environ.get("YTDLP_COOKIES"):
+    try:
+        COOKIES_PATH = "/tmp/cookies.txt"
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(os.environ["YTDLP_COOKIES"])
+    except Exception as e:
+        COOKIES_PATH = None
+        logger.warning("Failed to load YTDLP_COOKIES: %s", e)
+
 # ---------------- Utilities ----------------
 YDL_BASE_OPTS = {
     "quiet": True,
@@ -101,7 +121,19 @@ YDL_BASE_OPTS = {
     "extract_flat": False,
     "noplaylist": True,
     "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
+    "retries": 3,
+    "fragment_retries": 3,
+    "http_headers": {"User-Agent": "Mozilla/5.0"},
+    "force_ipv4": True,
+    # Иногда помогает обходить блокировки
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"]  # альтернативный клиент
+        }
+    },
 }
+if COOKIES_PATH:
+    YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
 
 AUDIO_OPTS = {
     **YDL_BASE_OPTS,
@@ -112,9 +144,6 @@ AUDIO_OPTS = {
         "preferredcodec": "mp3",
         "preferredquality": "192",
     }],
-    "retries": 3,
-    "fragment_retries": 3,
-    "http_headers": {"User-Agent": "Mozilla/5.0"},
 }
 
 SEARCH_OPTS = {**YDL_BASE_OPTS, "extract_flat": "in_playlist"}
@@ -188,11 +217,9 @@ def extract_video_id(candidate: str) -> Optional[str]:
     return None
 
 def _from_any_dict(d: dict, *keys: str) -> Optional[str]:
-    """Достаёт первое непустое значение по любому из ключей (учитывая вложенность типа data/payload/body)."""
     for k in keys:
         if k in d and d[k]:
             return str(d[k])
-    # вложенные контейнеры
     for nested_key in ("data", "payload", "body"):
         sub = d.get(nested_key)
         if isinstance(sub, dict):
@@ -208,22 +235,19 @@ async def convert(request: Request):
     raw = b""
     ctype = (request.headers.get("content-type") or "").lower()
 
-    # 0) из query — всегда как fallback
+    # query fallback
     vid_qp   = qp.get("video_id") or qp.get("id") or qp.get("url") or ""
     title_qp = qp.get("title") or ""
     nick_qp  = qp.get("nick") or ""
     ip_qp    = qp.get("ip") or ""
     serial_qp= qp.get("serial") or ""
 
-    # 1) JSON
+    # JSON
     data: Union[dict, list, str] = {}
     try:
         data = await request.json()
         if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except Exception:
-                pass
+            data = json.loads(data)
     except Exception:
         data = {}
 
@@ -234,12 +258,11 @@ async def convert(request: Request):
         ip    = _from_any_dict(data, "ip") or ""
         serial= _from_any_dict(data, "serial", "serialNumber") or ""
     elif isinstance(data, list) and data:
-        # если пришёл массив — попробуем первый элемент как dict
         if isinstance(data[0], dict):
             vid   = _from_any_dict(data[0], "video_id", "videoId", "id", "url") or ""
             title = _from_any_dict(data[0], "title") or ""
 
-    # 2) form/urlencoded или сырое тело
+    # form/raw
     if not vid:
         raw = await request.body()
         if b"&" in raw or "application/x-www-form-urlencoded" in ctype:
@@ -254,10 +277,8 @@ async def convert(request: Request):
             except Exception:
                 pass
         elif raw:
-            s = raw.decode("utf-8", "ignore").strip()
-            vid = s
+            vid = raw.decode("utf-8", "ignore").strip()
 
-    # 3) финальный fallback — query
     if not vid:
         vid   = vid_qp
         title = title or title_qp
@@ -265,33 +286,25 @@ async def convert(request: Request):
         ip    = ip or ip_qp
         serial= serial or serial_qp
 
-    # лог
-    preview = ""
-    try:
-        if raw:
-            s = raw.decode("utf-8", "ignore")
-            preview = s[:200].replace("\n", "\\n")
-    except Exception:
-        preview = "<decode-failed>"
-    logger.info(f"/convert ctype={ctype} vid_raw={repr(vid)} qp={dict(qp)} raw_len={len(raw)} raw_preview={preview}")
+    logger.info(f"/convert ctype={ctype} vid_raw={repr(vid)} qp={dict(qp)} raw_len={len(raw)}")
 
-    # очистим до «чистого» youtube id
     vid = extract_video_id(vid or "")
     if not vid:
-        raise HTTPException(status_code=400, detail={
-            "error": "video_id missing or invalid",
-            "hint": "send JSON {'video_id': '...'} or use /convert?video_id=...",
-            "query": dict(qp),
-            "content_type": ctype,
-            "raw_len": len(raw),
-            "raw_preview": preview
-        })
+        raise HTTPException(status_code=400, detail="video_id missing or invalid")
 
     target = mp3_path_for(vid)
     if not is_fresh(target):
         url = f"https://www.youtube.com/watch?v={vid}"
-        with YoutubeDL(AUDIO_OPTS) as ydl:
-            ydl.download([url])
+        try:
+            with YoutubeDL(AUDIO_OPTS) as ydl:
+                ydl.download([url])
+        except DownloadError as e:
+            # Отдадим понятную ошибку, чтобы было видно, что нужны куки
+            raise HTTPException(status_code=403, detail={
+                "error": "youtube_requires_cookies",
+                "message": str(e).splitlines()[-1],
+                "need_env": "Set YTDLP_COOKIES_B64 (base64 of cookies.txt in Netscape format) or YTDLP_COOKIES",
+            })
 
     db_add_play(vid, title or "", nick or "", ip or "", serial or "")
     rel = os.path.basename(target)
@@ -330,7 +343,8 @@ def root():
     return {
         "service": "YouTube MP3 Bridge for MTA",
         "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping"],
-        "cache_ttl_sec": CACHE_TTL_SECONDS
+        "cache_ttl_sec": CACHE_TTL_SECONDS,
+        "cookies_loaded": bool(COOKIES_PATH),
     }
 
 if __name__ == "__main__":
