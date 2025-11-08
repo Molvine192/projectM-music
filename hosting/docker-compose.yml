@@ -10,3 +10,5 @@ services:
       YTDLP_COOKIES_B64: "${YTDLP_COOKIES_B64}"
     volumes:
       - ./media:/data
+    image: mta-youtube-mp3
+    env_file: .env
