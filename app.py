@@ -14,7 +14,6 @@ import logging
 import base64
 import subprocess
 import urllib.request
-import urllib.error
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -138,9 +137,12 @@ YDL_BASE_OPTS = {
 if COOKIES_PATH:
     YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
 
+# более живучий селектор
+YDL_FORMAT_SELECTOR = "bestaudio[acodec!=none]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+
 AUDIO_OPTS = {
     **YDL_BASE_OPTS,
-    "format": "bestaudio/best",
+    "format": YDL_FORMAT_SELECTOR,
     "outtmpl": os.path.join(MEDIA_ROOT, "%(id)s.%(ext)s"),
     "postprocessors": [{
         "key": "FFmpegExtractAudio",
@@ -229,6 +231,36 @@ def ffmpeg_transcode_to_mp3(input_url: str, target_path: str) -> bool:
     except Exception as e:
         logger.warning("ffmpeg failed: %s", e)
         return False
+
+# --------- helper: скачать через yt-dlp вручную выбранный формат ---------
+def ytdlp_download_best_audio_manually(video_id: str, target_path: str) -> bool:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        with YoutubeDL({**YDL_BASE_OPTS}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.warning("extract_info failed: %s", e)
+        return False
+
+    fmts = (info or {}).get("formats") or []
+    best = None
+    best_abr = -1
+    for f in fmts:
+        # ищем чисто аудио
+        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none") and f.get("url"):
+            abr = f.get("abr") or 0
+            try:
+                abr = int(abr)
+            except Exception:
+                abr = 0
+            if abr > best_abr:
+                best = f
+                best_abr = abr
+
+    if not best:
+        return False
+
+    return ffmpeg_transcode_to_mp3(best["url"], target_path)
 
 # ---------------- Endpoints ----------------
 @app.get("/ping")
@@ -341,35 +373,39 @@ async def convert(request: Request):
     target = mp3_path_for(vid)
     if not is_fresh(target):
         url = f"https://www.youtube.com/watch?v={vid}"
-        # 1) yt-dlp
+        # 1) yt-dlp обычным способом (с живучим селектором)
         try:
             with YoutubeDL(AUDIO_OPTS) as ydl:
                 ydl.download([url])
         except DownloadError as e:
             logger.warning("yt-dlp failed: %s", str(e).splitlines()[-1])
-            # 2) Piped → ffmpeg
-            if PIPED_FALLBACK:
-                audio_url = None
-                try:
-                    audio_url = piped_best_audio_url(vid)
-                except Exception as pe:
-                    logger.warning("piped fetch failed: %s", pe)
-                if audio_url:
-                    ok = ffmpeg_transcode_to_mp3(audio_url, target)
-                    if not ok:
-                        return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
+
+            # 2) yt-dlp: ручной выбор лучшей аудио-дорожки + ffmpeg
+            ok_manual = ytdlp_download_best_audio_manually(vid, target)
+            if not ok_manual:
+                # 3) Piped → ffmpeg
+                if PIPED_FALLBACK:
+                    audio_url = None
+                    try:
+                        audio_url = piped_best_audio_url(vid)
+                    except Exception as pe:
+                        logger.warning("piped fetch failed: %s", pe)
+                    if audio_url:
+                        ok = ffmpeg_transcode_to_mp3(audio_url, target)
+                        if not ok:
+                            return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
+                    else:
+                        return JSONResponse(status_code=200, content={
+                            "ok": False,
+                            "error": "youtube_requires_cookies_or_piped_failed",
+                            "cookies_loaded": bool(COOKIES_PATH),
+                        })
                 else:
                     return JSONResponse(status_code=200, content={
                         "ok": False,
-                        "error": "youtube_requires_cookies_or_piped_failed",
+                        "error": "youtube_requires_cookies",
                         "cookies_loaded": bool(COOKIES_PATH),
                     })
-            else:
-                return JSONResponse(status_code=200, content={
-                    "ok": False,
-                    "error": "youtube_requires_cookies",
-                    "cookies_loaded": bool(COOKIES_PATH),
-                })
 
     db_add_play(vid, title or "", nick or "", ip or "", serial or "")
     rel = os.path.basename(target)
