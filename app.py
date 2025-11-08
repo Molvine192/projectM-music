@@ -18,14 +18,12 @@ CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "900")
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "30"))
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Piped fallback (перебор нескольких инстансов)
+# Piped fallback instances (перебор)
 PIPED_INSTANCES: List[str] = [
-    *(os.environ.get("PIPED_INSTANCE", "https://piped.video").split(",")),
-    "https://pipedapi.kavin.rocks",
-    "https://piped.mha.fi",
+    *(os.environ.get("PIPED_INSTANCE", "https://pipedapi.kavin.rocks,https://piped.mha.fi,https://piped.video,https://piped.projectsegfau.lt").split(",")),
 ]
 PIPED_INSTANCES = [u.strip() for u in PIPED_INSTANCES if u.strip()]
-PIPED_TIMEOUT = int(os.environ.get("PIPED_TIMEOUT", "15"))
+PIPED_TIMEOUT = int(os.environ.get("PIPED_TIMEOUT", "25"))
 
 DB_PATH = os.path.join(MEDIA_ROOT, "history.sqlite3")
 
@@ -108,9 +106,9 @@ YDL_BASE_OPTS = {
     "fragment_retries": 3,
     "http_headers": {"User-Agent": UA},
     "force_ipv4": True,
+    "ignoreconfig": True,  # <<< критично: игнорировать системные конфиги yt-dlp
     "extractor_args": {
         "youtube": {
-            # если есть cookies — сначала "web", иначе "android"
             "player_client": ["web"] if use_web_client else ["android"]
         }
     },
@@ -118,11 +116,7 @@ YDL_BASE_OPTS = {
 if COOKIES_PATH:
     YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
 
-
-# ВАРИАНТ для поиска (flat) — ок
 SEARCH_OPTS = {**YDL_BASE_OPTS, "extract_flat": "in_playlist"}
-
-# Инфо без формат-селектора и без постпроцессоров (чтобы не ловить "Requested format is not available")
 YDL_INFO_OPTS = {**YDL_BASE_OPTS}
 
 executor = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "2")))
@@ -159,14 +153,9 @@ def extract_video_id(candidate: str) -> Optional[str]:
     m = YOUTUBE_URL_RE.search(candidate);  return m.group(1) if m else None
 
 def pick_best_audio_from_formats(formats) -> Optional[str]:
-    """
-    Выбрать лучшую аудиодорожку по abr из formats.
-    """
     best_url, best_abr = None, -1
     for f in formats or []:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        url = f.get("url")
+        vcodec = f.get("vcodec"); acodec = f.get("acodec"); url = f.get("url")
         if url and (vcodec in (None, "none")) and (acodec not in (None, "none")):
             abr = f.get("abr") or 0
             try: abr = int(abr)
@@ -196,7 +185,6 @@ def piped_best_audio_url(video_id: str) -> Optional[str]:
                     continue
                 data = json.loads(resp.read().decode("utf-8","ignore"))
                 streams = data.get("audioStreams") or []
-                # max bitrate
                 best = None; best_rate = -1
                 for s in streams:
                     try: rate = int(s.get("bitrate") or s.get("bitrateKbps") or 0)
@@ -243,7 +231,7 @@ async def convert(request: Request):
     except Exception:
         pass
     if isinstance(data, dict):
-        def pick(d,*ks): 
+        def pick(d,*ks):
             for k in ks:
                 if d.get(k): return str(d[k])
             for nest in ("data","payload","body"):
@@ -289,16 +277,17 @@ async def convert(request: Request):
     if not is_fresh(target):
         url = f"https://www.youtube.com/watch?v={vid}"
 
-        # ---- ШАГ 1: только extract_info, без format/постпроцессоров; ffmpeg руками
+        # ---- ШАГ 1: только extract_info, БЕЗ формат-селекторов (ignoreconfig=True), дальше ffmpeg
         try:
             with YoutubeDL(YDL_INFO_OPTS) as ydl:
                 info = ydl.extract_info(url, download=False)
-            fmt_url = pick_best_audio_from_formats((info or {}).get("formats"))
+            fmts = (info or {}).get("formats") or []
+            fmt_url = pick_best_audio_from_formats(fmts)
             if fmt_url:
                 if not ffmpeg_transcode_to_mp3(fmt_url, target):
                     return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
             else:
-                raise DownloadError("no audio-only format in formats")
+                raise DownloadError("no audio-only formats")
         except Exception as e:
             logger.warning("info/ffmpeg path failed: %s", str(e).splitlines()[-1])
 
@@ -317,6 +306,30 @@ async def convert(request: Request):
     db_add_play(vid, title or "", nick or "", ip or "", serial or "")
     rel = os.path.basename(target)
     return {"ok": True, "video_id": vid, "mp3": f"/media/{rel}"}
+
+# ---------- Diag ----------
+@app.get("/diag")
+def diag(video_id: str):
+    vid = extract_video_id(video_id)
+    if not vid:
+        return {"ok": False, "where": "input", "msg": "bad video_id"}
+    url = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        with YoutubeDL(YDL_INFO_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+        fmts = info.get("formats") or []
+        audio_only = [f for f in fmts if (f.get("vcodec") in (None,"none")) and (f.get("acodec") not in (None,"none")) and f.get("url")]
+        return {
+            "ok": True,
+            "cookies_loaded": bool(COOKIES_PATH),
+            "ua": YDL_BASE_OPTS["http_headers"]["User-Agent"],
+            "player_client": YDL_BASE_OPTS.get("extractor_args",{}).get("youtube",{}).get("player_client"),
+            "formats_total": len(fmts),
+            "audio_only": len(audio_only),
+            "sample": audio_only[:3],
+        }
+    except Exception as e:
+        return {"ok": False, "where": "yt_dlp", "msg": str(e)}
 
 # ---------- Static / status ----------
 @app.get("/media/{filename}")
@@ -339,35 +352,13 @@ def status():
 def root():
     return {
         "service": "YouTube MP3 Bridge for MTA",
-        "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping"],
+        "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping", "/diag?video_id="],
         "cache_ttl_sec": CACHE_TTL_SECONDS,
         "cookies_loaded": bool(COOKIES_PATH),
+        "ua": UA,
+        "player_client": ("web" if use_web_client else "android"),
         "piped_instances": PIPED_INSTANCES,
     }
-
-@app.get("/diag")
-def diag(video_id: str):
-    vid = extract_video_id(video_id)
-    if not vid:
-        return {"ok": False, "where": "input", "msg": "bad video_id"}
-    url = f"https://www.youtube.com/watch?v={vid}"
-    try:
-        with YoutubeDL({**YDL_BASE_OPTS}) as ydl:
-            info = ydl.extract_info(url, download=False)
-        fmts = info.get("formats") or []
-        audio_only = [f for f in fmts if (f.get("vcodec") in (None,"none")) and (f.get("acodec") not in (None,"none"))]
-        return {
-            "ok": True,
-            "cookies_loaded": bool(COOKIES_PATH),
-            "ua": YDL_BASE_OPTS["http_headers"]["User-Agent"],
-            "player_client": YDL_BASE_OPTS.get("extractor_args",{}).get("youtube",{}).get("player_client"),
-            "formats_total": len(fmts),
-            "audio_only": len(audio_only),
-            "sample": audio_only[:3],
-        }
-    except Exception as e:
-        return {"ok": False, "where": "yt_dlp", "msg": str(e)}
-
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
