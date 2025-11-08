@@ -95,29 +95,32 @@ elif os.environ.get("YTDLP_COOKIES"):
 
 # ---------------- Utilities ----------------
 UA = os.environ.get("YTDLP_UA", "Mozilla/5.0")
-use_web_client = bool(os.environ.get("YTDLP_FORCE_WEB", "")) or bool(os.environ.get("YTDLP_COOKIES") or os.environ.get("YTDLP_COOKIES_B64"))
+GEO_BYPASS_COUNTRY = os.environ.get("YTDLP_GEO_BYPASS_COUNTRY", "US")
 
-YDL_BASE_OPTS: Dict[str, Any] = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
-    "retries": 3,
-    "fragment_retries": 3,
-    "http_headers": {"User-Agent": UA},
-    "force_ipv4": True,
-    "ignoreconfig": True,  # критично: игнор любых системных конфигов yt-dlp
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web"] if use_web_client else ["android"]
-        }
-    },
-}
-if COOKIES_PATH:
-    YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
+# порядок перебора клиентов YouTube API (расширенный)
+PLAYER_CLIENTS_WITH_COOKIES = ["web", "web_embedded", "android", "ios", "tv_embedded"]
+PLAYER_CLIENTS_NO_COOKIES   = ["android", "web", "web_embedded", "ios", "tv_embedded"]
 
-SEARCH_OPTS = {**YDL_BASE_OPTS, "extract_flat": "in_playlist"}
-YDL_INFO_OPTS = {**YDL_BASE_OPTS}  # без format и постпроцессоров
+def ydl_base_opts(player_client: str) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
+        "retries": 3,
+        "fragment_retries": 3,
+        "http_headers": {"User-Agent": UA},
+        "force_ipv4": True,
+        "ignoreconfig": True,     # игнор любых внешних конфигов yt-dlp
+        "geo_bypass_country": GEO_BYPASS_COUNTRY,
+        "extractor_args": {"youtube": {"player_client": [player_client]}},
+    }
+    if COOKIES_PATH:
+        opts["cookiefile"] = COOKIES_PATH
+    return opts
+
+SEARCH_OPTS = {**ydl_base_opts("android"), "extract_flat": "in_playlist"}  # поиск надёжнее с android
+YDL_INFO_DEFAULT = ydl_base_opts("web")  # стартуем с web
 
 executor = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "2")))
 
@@ -198,12 +201,36 @@ def piped_best_audio_url(video_id: str) -> Optional[str]:
     return None
 
 def env_ytdl_vars() -> Dict[str, str]:
-    # соберём все env, которые могут подпортить yt-dlp
     out = {}
     for k, v in os.environ.items():
         if k.startswith("YT_DLP") or k.startswith("YTDL"):
             out[k] = v if len(v) < 200 else (v[:200] + "...(truncated)")
     return out
+
+def try_extract_info_with_clients(video_id: str) -> Optional[str]:
+    """
+    Пытаемся получить URL лучшей аудио-дорожки, перебирая разные player_client.
+    Возвращает прямой URL потока или None.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    has_cookies = bool(COOKIES_PATH)
+    order = PLAYER_CLIENTS_WITH_COOKIES if has_cookies else PLAYER_CLIENTS_NO_COOKIES
+
+    for client in order:
+        opts = ydl_base_opts(client)
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            fmts = (info or {}).get("formats") or []
+            logger.info("extract with client=%s: formats_total=%d", client, len(fmts))
+            stream_url = pick_best_audio_from_formats(fmts)
+            if stream_url:
+                logger.info("extract with client=%s: picked audio", client)
+                return stream_url
+        except Exception as e:
+            logger.warning("extract failed client=%s: %s", client, str(e).splitlines()[-1])
+            continue
+    return None
 
 # ---------------- Endpoints ----------------
 @app.get("/ping")
@@ -256,7 +283,6 @@ async def convert(request: Request):
     if not vid:
         raw = await request.body()
         if b"&" in raw or "application/x-www-form-urlencoded" in ctype:
-            from urllib.parse import parse_qs
             try:
                 form = parse_qs(raw.decode("utf-8","ignore"))
                 vid = (form.get("video_id",[""])[0] or form.get("videoId",[""])[0] or form.get("id",[""])[0] or form.get("url",[""])[0])
@@ -283,25 +309,13 @@ async def convert(request: Request):
 
     target = mp3_path_for(vid)
     if not is_fresh(target):
-        url = f"https://www.youtube.com/watch?v={vid}"
-
-        # ---- ШАГ 1: только extract_info; дальше ffmpeg
-        try:
-            with YoutubeDL(YDL_INFO_OPTS) as ydl:
-                info = ydl.extract_info(url, download=False)
-            fmts = (info or {}).get("formats") or []
-            logger.info("convert: formats_total=%s", len(fmts))
-            fmt_url = pick_best_audio_from_formats(fmts)
-            logger.info("convert: picked_audio_url=%s", bool(fmt_url))
-            if fmt_url:
-                if not ffmpeg_transcode_to_mp3(fmt_url, target):
-                    return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
-            else:
-                raise DownloadError("no audio-only formats")
-        except Exception as e:
-            logger.warning("info/ffmpeg path failed: %s", str(e).splitlines()[-1])
-
-            # ---- ШАГ 2: Piped → ffmpeg
+        # 1) yt-dlp: перебор клиентов
+        stream_url = try_extract_info_with_clients(vid)
+        if stream_url:
+            if not ffmpeg_transcode_to_mp3(stream_url, target):
+                return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
+        else:
+            # 2) Piped → ffmpeg
             audio_url = piped_best_audio_url(vid)
             if audio_url:
                 if not ffmpeg_transcode_to_mp3(audio_url, target):
@@ -325,7 +339,7 @@ def diag(video_id: str):
         return {"ok": False, "where": "input", "msg": "bad video_id"}
     url = f"https://www.youtube.com/watch?v={vid}"
     try:
-        with YoutubeDL({**YDL_INFO_OPTS, "verbose": False}) as ydl:
+        with YoutubeDL(YDL_INFO_DEFAULT) as ydl:
             params = dict(ydl.params)
             info = ydl.extract_info(url, download=False)
         fmts = info.get("formats") or []
@@ -342,9 +356,9 @@ def diag(video_id: str):
         return {
             "ok": True,
             "cookies_loaded": bool(COOKIES_PATH),
-            "ua": YDL_BASE_OPTS["http_headers"]["User-Agent"],
-            "player_client": YDL_BASE_OPTS.get("extractor_args",{}).get("youtube",{}).get("player_client"),
-            "ydl_params": {k: v for k, v in params.items() if k in ("format","ignoreconfig","cookiefile","extractor_args","http_headers")},
+            "ua": UA,
+            "player_client": YDL_INFO_DEFAULT.get("extractor_args",{}).get("youtube",{}).get("player_client"),
+            "ydl_params": {k: v for k, v in params.items() if k in ("format","ignoreconfig","cookiefile","extractor_args","http_headers","geo_bypass_country")},
             "env_ytdl": env_ytdl_vars(),
             "formats_total": len(fmts),
             "audio_only": len(audio_only),
@@ -355,7 +369,7 @@ def diag(video_id: str):
             "ok": False, "where": "yt_dlp", "msg": str(e),
             "trace": traceback.format_exc(limit=2),
             "env_ytdl": env_ytdl_vars(),
-            "params": YDL_INFO_OPTS,
+            "params": YDL_INFO_DEFAULT,
         }
 
 @app.get("/diag_piped")
@@ -400,7 +414,6 @@ def root():
         "cache_ttl_sec": CACHE_TTL_SECONDS,
         "cookies_loaded": bool(COOKIES_PATH),
         "ua": UA,
-        "player_client": ("web" if use_web_client else "android"),
         "piped_instances": PIPED_INSTANCES,
     }
 
