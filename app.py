@@ -20,7 +20,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 # Piped fallback instances
 PIPED_INSTANCES: List[str] = [
-    *(os.environ.get("PIPED_INSTANCE", "https://pipedapi.kavin.rocks,https://piped.mha.fi,https://piped.video,https://piped.projectsegfau.lt").split(",")),
+    *(os.environ.get("PIPED_INSTANCE", "https://pipedapi.kavin.rocks,https://piped.mha.fi,https://piped.video,https://piped.projectsegfau.lt,https://piped.phoenixthrush.com").split(",")),
 ]
 PIPED_INSTANCES = [u.strip() for u in PIPED_INSTANCES if u.strip()]
 PIPED_TIMEOUT = int(os.environ.get("PIPED_TIMEOUT", "25"))
@@ -97,7 +97,7 @@ elif os.environ.get("YTDLP_COOKIES"):
 UA = os.environ.get("YTDLP_UA", "Mozilla/5.0")
 GEO_BYPASS_COUNTRY = os.environ.get("YTDLP_GEO_BYPASS_COUNTRY", "US")
 
-# порядок перебора клиентов YouTube API (расширенный)
+# порядок перебора клиентов YouTube API
 PLAYER_CLIENTS_WITH_COOKIES = ["web", "web_embedded", "android", "ios", "tv_embedded"]
 PLAYER_CLIENTS_NO_COOKIES   = ["android", "web", "web_embedded", "ios", "tv_embedded"]
 
@@ -114,13 +114,15 @@ def ydl_base_opts(player_client: str) -> Dict[str, Any]:
         "ignoreconfig": True,     # игнор любых внешних конфигов yt-dlp
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "extractor_args": {"youtube": {"player_client": [player_client]}},
+        # доп. мягкие совместимости (необязательно, но иногда помогает)
+        "compat_opts": [],
     }
     if COOKIES_PATH:
         opts["cookiefile"] = COOKIES_PATH
     return opts
 
 SEARCH_OPTS = {**ydl_base_opts("android"), "extract_flat": "in_playlist"}  # поиск надёжнее с android
-YDL_INFO_DEFAULT = ydl_base_opts("web")  # стартуем с web
+YDL_INFO_DEFAULT = ydl_base_opts("web")
 
 executor = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "2")))
 
@@ -372,6 +374,34 @@ def diag(video_id: str):
             "params": YDL_INFO_DEFAULT,
         }
 
+@app.get("/diag_clients")
+def diag_clients(video_id: str):
+    vid = extract_video_id(video_id)
+    if not vid:
+        return {"ok": False, "msg": "bad video_id"}
+    url = f"https://www.youtube.com/watch?v={vid}"
+    has_cookies = bool(COOKIES_PATH)
+    order = PLAYER_CLIENTS_WITH_COOKIES if has_cookies else PLAYER_CLIENTS_NO_COOKIES
+    out = []
+    for client in order:
+        opts = ydl_base_opts(client)
+        item = {"client": client}
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            fmts = (info or {}).get("formats") or []
+            audio_only = [f for f in fmts if (f.get("vcodec") in (None,"none")) and (f.get("acodec") not in (None,"none")) and f.get("url")]
+            item.update({
+                "ok": True,
+                "formats_total": len(fmts),
+                "audio_only": len(audio_only),
+                "picked": bool(pick_best_audio_from_formats(fmts)),
+            })
+        except Exception as e:
+            item.update({"ok": False, "error": str(e)})
+        out.append(item)
+    return {"ok": True, "cookies_loaded": has_cookies, "ua": UA, "results": out}
+
 @app.get("/diag_piped")
 def diag_piped(video_id: str):
     vid = extract_video_id(video_id)
@@ -410,7 +440,7 @@ def status():
 def root():
     return {
         "service": "YouTube MP3 Bridge for MTA",
-        "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping", "/diag?video_id=", "/diag_piped?video_id="],
+        "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping", "/diag?video_id=", "/diag_clients?video_id=", "/diag_piped?video_id="],
         "cache_ttl_sec": CACHE_TTL_SECONDS,
         "cookies_loaded": bool(COOKIES_PATH),
         "ua": UA,
