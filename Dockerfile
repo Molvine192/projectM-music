@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # App deps
 RUN pip install --no-cache-dir fastapi uvicorn[standard] yt-dlp
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # App
 WORKDIR /app

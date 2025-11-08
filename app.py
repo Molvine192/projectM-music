@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
@@ -11,25 +11,33 @@ from typing import Optional, Union
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs
 import logging
+import base64
+import subprocess
+import urllib.request
+import urllib.error
+
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 import uvicorn
-import base64
 
 # ---------------- Config ----------------
 MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/data")
 os.makedirs(MEDIA_ROOT, exist_ok=True)
 
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", str(24 * 3600)))  # default 24h
-CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "900"))  # 15 min
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", str(24 * 3600)))
+CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "900"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "30"))
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Fallback через Piped (работает без куков)
+PIPED_FALLBACK = os.environ.get("PIPED_FALLBACK", "1") not in ("0", "false", "False", "")
+PIPED_INSTANCE = os.environ.get("PIPED_INSTANCE", "https://piped.video")
+PIPED_TIMEOUT = int(os.environ.get("PIPED_TIMEOUT", "15"))
 
 DB_PATH = os.path.join(MEDIA_ROOT, "history.sqlite3")
 
 # ---------------- App ----------------
 app = FastAPI(title="YouTube MP3 Bridge for MTA")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -95,7 +103,7 @@ def db_recent(limit=50):
         for r in rows
     ]
 
-# ---------------- Cookies support ----------------
+# ---------------- Cookies support (optional) ----------------
 COOKIES_PATH = None
 if os.environ.get("YTDLP_COOKIES_B64"):
     try:
@@ -125,12 +133,7 @@ YDL_BASE_OPTS = {
     "fragment_retries": 3,
     "http_headers": {"User-Agent": "Mozilla/5.0"},
     "force_ipv4": True,
-    # Иногда помогает обходить блокировки
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android"]  # альтернативный клиент
-        }
-    },
+    "extractor_args": {"youtube": {"player_client": ["android"]}},
 }
 if COOKIES_PATH:
     YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
@@ -179,6 +182,53 @@ def schedule_cleanup():
     threading.Thread(target=loop, daemon=True).start()
 
 schedule_cleanup()
+
+# ---------------- Piped fallback ----------------
+def piped_stream_info(video_id: str) -> Optional[dict]:
+    url = f"{PIPED_INSTANCE.rstrip('/')}/api/v1/streams/{video_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=PIPED_TIMEOUT) as resp:
+        if resp.status != 200:
+            return None
+        data = resp.read()
+    try:
+        return json.loads(data.decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+def piped_best_audio_url(video_id: str) -> Optional[str]:
+    info = piped_stream_info(video_id)
+    if not info:
+        return None
+    streams = info.get("audioStreams") or []
+    best = None
+    best_rate = -1
+    for s in streams:
+        try:
+            abr = int(s.get("bitrate") or s.get("bitrateKbps") or 0)
+        except Exception:
+            abr = 0
+        if abr > best_rate and s.get("url"):
+            best = s
+            best_rate = abr
+    return best.get("url") if best else None
+
+def ffmpeg_transcode_to_mp3(input_url: str, target_path: str) -> bool:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_url,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "192k",
+        target_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+        return proc.returncode == 0
+    except Exception as e:
+        logger.warning("ffmpeg failed: %s", e)
+        return False
 
 # ---------------- Endpoints ----------------
 @app.get("/ping")
@@ -235,14 +285,12 @@ async def convert(request: Request):
     raw = b""
     ctype = (request.headers.get("content-type") or "").lower()
 
-    # query fallback
     vid_qp   = qp.get("video_id") or qp.get("id") or qp.get("url") or ""
     title_qp = qp.get("title") or ""
     nick_qp  = qp.get("nick") or ""
     ip_qp    = qp.get("ip") or ""
     serial_qp= qp.get("serial") or ""
 
-    # JSON
     data: Union[dict, list, str] = {}
     try:
         data = await request.json()
@@ -262,7 +310,6 @@ async def convert(request: Request):
             vid   = _from_any_dict(data[0], "video_id", "videoId", "id", "url") or ""
             title = _from_any_dict(data[0], "title") or ""
 
-    # form/raw
     if not vid:
         raw = await request.body()
         if b"&" in raw or "application/x-www-form-urlencoded" in ctype:
@@ -287,24 +334,42 @@ async def convert(request: Request):
         serial= serial or serial_qp
 
     logger.info(f"/convert ctype={ctype} vid_raw={repr(vid)} qp={dict(qp)} raw_len={len(raw)}")
-
     vid = extract_video_id(vid or "")
     if not vid:
-        raise HTTPException(status_code=400, detail="video_id missing or invalid")
+        return JSONResponse(status_code=200, content={"ok": False, "error": "video_id_missing_or_invalid"})
 
     target = mp3_path_for(vid)
     if not is_fresh(target):
         url = f"https://www.youtube.com/watch?v={vid}"
+        # 1) yt-dlp
         try:
             with YoutubeDL(AUDIO_OPTS) as ydl:
                 ydl.download([url])
         except DownloadError as e:
-            # Отдадим понятную ошибку, чтобы было видно, что нужны куки
-            raise HTTPException(status_code=403, detail={
-                "error": "youtube_requires_cookies",
-                "message": str(e).splitlines()[-1],
-                "need_env": "Set YTDLP_COOKIES_B64 (base64 of cookies.txt in Netscape format) or YTDLP_COOKIES",
-            })
+            logger.warning("yt-dlp failed: %s", str(e).splitlines()[-1])
+            # 2) Piped → ffmpeg
+            if PIPED_FALLBACK:
+                audio_url = None
+                try:
+                    audio_url = piped_best_audio_url(vid)
+                except Exception as pe:
+                    logger.warning("piped fetch failed: %s", pe)
+                if audio_url:
+                    ok = ffmpeg_transcode_to_mp3(audio_url, target)
+                    if not ok:
+                        return JSONResponse(status_code=200, content={"ok": False, "error": "ffmpeg_failed"})
+                else:
+                    return JSONResponse(status_code=200, content={
+                        "ok": False,
+                        "error": "youtube_requires_cookies_or_piped_failed",
+                        "cookies_loaded": bool(COOKIES_PATH),
+                    })
+            else:
+                return JSONResponse(status_code=200, content={
+                    "ok": False,
+                    "error": "youtube_requires_cookies",
+                    "cookies_loaded": bool(COOKIES_PATH),
+                })
 
     db_add_play(vid, title or "", nick or "", ip or "", serial or "")
     rel = os.path.basename(target)
@@ -345,6 +410,8 @@ def root():
         "endpoints": ["/search?q=", "/convert", "/media/<file>", "/status", "/ping"],
         "cache_ttl_sec": CACHE_TTL_SECONDS,
         "cookies_loaded": bool(COOKIES_PATH),
+        "piped_fallback": PIPED_FALLBACK,
+        "piped_instance": PIPED_INSTANCE,
     }
 
 if __name__ == "__main__":
