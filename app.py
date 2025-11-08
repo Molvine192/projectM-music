@@ -97,6 +97,8 @@ elif os.environ.get("YTDLP_COOKIES"):
 
 # ---------------- Utilities ----------------
 UA = os.environ.get("YTDLP_UA", "Mozilla/5.0")
+use_web_client = bool(os.environ.get("YTDLP_FORCE_WEB", "")) or bool(os.environ.get("YTDLP_COOKIES") or os.environ.get("YTDLP_COOKIES_B64"))
+
 YDL_BASE_OPTS = {
     "quiet": True,
     "no_warnings": True,
@@ -104,12 +106,18 @@ YDL_BASE_OPTS = {
     "cachedir": os.path.join(MEDIA_ROOT, ".cache"),
     "retries": 3,
     "fragment_retries": 3,
-    "http_headers": {"User-Agent": UA},   # <-- вот тут
+    "http_headers": {"User-Agent": UA},
     "force_ipv4": True,
-    "extractor_args": {"youtube": {"player_client": ["android"]}},
+    "extractor_args": {
+        "youtube": {
+            # если есть cookies — сначала "web", иначе "android"
+            "player_client": ["web"] if use_web_client else ["android"]
+        }
+    },
 }
 if COOKIES_PATH:
     YDL_BASE_OPTS["cookiefile"] = COOKIES_PATH
+
 
 # ВАРИАНТ для поиска (flat) — ок
 SEARCH_OPTS = {**YDL_BASE_OPTS, "extract_flat": "in_playlist"}
@@ -336,6 +344,30 @@ def root():
         "cookies_loaded": bool(COOKIES_PATH),
         "piped_instances": PIPED_INSTANCES,
     }
+
+@app.get("/diag")
+def diag(video_id: str):
+    vid = extract_video_id(video_id)
+    if not vid:
+        return {"ok": False, "where": "input", "msg": "bad video_id"}
+    url = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        with YoutubeDL({**YDL_BASE_OPTS}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        fmts = info.get("formats") or []
+        audio_only = [f for f in fmts if (f.get("vcodec") in (None,"none")) and (f.get("acodec") not in (None,"none"))]
+        return {
+            "ok": True,
+            "cookies_loaded": bool(COOKIES_PATH),
+            "ua": YDL_BASE_OPTS["http_headers"]["User-Agent"],
+            "player_client": YDL_BASE_OPTS.get("extractor_args",{}).get("youtube",{}).get("player_client"),
+            "formats_total": len(fmts),
+            "audio_only": len(audio_only),
+            "sample": audio_only[:3],
+        }
+    except Exception as e:
+        return {"ok": False, "where": "yt_dlp", "msg": str(e)}
+
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
