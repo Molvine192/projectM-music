@@ -1,0 +1,15 @@
+version: '3.9'
+
+services:
+  api:
+    build: .
+    container_name: mta-youtube-mp3
+    ports:
+      - "8080:8080"
+    environment:
+      - CACHE_TTL_SECONDS=86400     # держим mp3 сутки
+      - WORKERS=2                   # параллельных загрузок
+      - PORT=8080                   # порт внутри контейнера
+    volumes:
+      - ./media:/data               # кэш и база
+    restart: unless-stopped
