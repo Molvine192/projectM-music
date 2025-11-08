@@ -1,0 +1,11 @@
+# Optional Render spec if you prefer render.yaml deployment
+services:
+  - type: web
+    name: mta-youtube-mp3
+    env: docker
+    plan: free
+    autoDeploy: true
+    disk:
+      name: media
+      mountPath: /data
+      sizeGB: 1
